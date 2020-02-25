@@ -18,6 +18,10 @@ export const CLOSE_EVENT = 'close';
 export const SUBSCRIBE = 'subscribe';
 export const CANCEL_EVENT = 'cancelled';
 
+// Adding this constant to provide opportunity to handleMessage() method
+// of Redis Server to differ either it shall handle common publish logic or modified one
+export const REDIS_LPOP_PING_VALUE = 'LPOP';
+
 export const PATTERN_METADATA = 'microservices:pattern';
 export const CLIENT_CONFIGURATION_METADATA = 'microservices:client';
 export const PATTERN_HANDLER_METADATA = 'microservices:handler_type';

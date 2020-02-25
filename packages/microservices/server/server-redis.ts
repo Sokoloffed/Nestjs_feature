@@ -6,6 +6,7 @@ import {
   MESSAGE_EVENT,
   NO_MESSAGE_HANDLER,
   REDIS_DEFAULT_URL,
+  REDIS_LPOP_PING_VALUE,
 } from '../constants';
 import { RedisContext } from '../ctx-host';
 import {
@@ -23,6 +24,9 @@ export class ServerRedis extends Server implements CustomTransportStrategy {
   private readonly url: string;
   private subClient: RedisClient;
   private pubClient: RedisClient;
+
+  // custom Redis client for lpush handling
+  private listClient: RedisClient;
   private isExplicitlyTerminated = false;
 
   constructor(private readonly options: RedisOptions['options']) {
@@ -38,8 +42,14 @@ export class ServerRedis extends Server implements CustomTransportStrategy {
   }
 
   public listen(callback: () => void) {
+    // initialization of redis client for lpush handling
+    this.listClient = this.createRedisClient();
+
     this.subClient = this.createRedisClient();
     this.pubClient = this.createRedisClient();
+
+    // adding listClient to handleError() method
+    this.handleError(this.listClient);
 
     this.handleError(this.pubClient);
     this.handleError(this.subClient);
@@ -80,26 +90,53 @@ export class ServerRedis extends Server implements CustomTransportStrategy {
       this.handleMessage(channel, buffer, pub);
   }
 
+  // Reimplemention of handleMessage() method to consume messages sent both via send/emit
+  // and sendList/emitList methods from ClientRedis
   public async handleMessage(
     channel: string,
+    // in this parameter we have a message, which was published via pubClient
+    // inside of ClientRedis publish/dispatchEvent methods
     buffer: string | any,
     pub: RedisClient,
   ) {
-    const rawMessage = this.parseMessage(buffer);
-    const packet = this.deserializer.deserialize(rawMessage, { channel });
+    const pattern = channel.replace(/_ack$/, '');
+    let rawMessage = this.parseMessage(buffer);
+    let packet = this.deserializer.deserialize(rawMessage, { channel });
+    // we`ve parsed value from pubClient above, and now we check - if the published value is predefined
+    // constant REDIS_LPOP_PING_VALUE, we handle message using lpop method
+    if (packet.data === REDIS_LPOP_PING_VALUE) {
+      // inside if statement we await the promise rejecting/resolving
+      // if success = we are overwriting rawMessage and packet variables,
+      // else - we continue with values, received from pubClient, not from listClient
+      const makeLpop = new Promise((resolve, reject) => {
+        this.listClient.lpop(pattern, async (error, response) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          if (!response) {
+            resolve();
+            return;
+          }
+          rawMessage = this.parseMessage(response);
+          packet = this.deserializer.deserialize(rawMessage, { channel });
+          resolve();
+          return;
+        });
+      });
+      await makeLpop;
+    }
+    // and then we return to NestJs standard ServerRedis flow
     const redisCtx = new RedisContext([channel]);
-
     if (isUndefined((packet as IncomingRequest).id)) {
       return this.handleEvent(channel, packet, redisCtx);
     }
-    const pattern = channel.replace(/_ack$/, '');
     const publish = this.getPublisher(
       pub,
       pattern,
       (packet as IncomingRequest).id,
     );
     const handler = this.getHandlerByPattern(pattern);
-
     if (!handler) {
       const status = 'error';
       const noHandlerPacket = {
@@ -110,9 +147,9 @@ export class ServerRedis extends Server implements CustomTransportStrategy {
       return publish(noHandlerPacket);
     }
     const response$ = this.transformToObservable(
-      await handler(packet.data, redisCtx),
+      await handler(packet.data),
     ) as Observable<any>;
-    response$ && this.send(response$, publish);
+    return response$ && this.send(response$, publish);
   }
 
   public getPublisher(pub: RedisClient, pattern: any, id: string) {
